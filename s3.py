@@ -1,7 +1,10 @@
 import os
 
 import boto3
+import polars as pl
+import pyarrow.dataset as ds
 import pyarrow.fs as pafs
+import pyarrow.parquet as pq
 from cloudpathlib import AnyPath, S3Client
 from cloudpathlib.local import LocalS3Client
 
@@ -87,21 +90,77 @@ class Storage:
             **kwargs,
         )
 
+    def is_s3_path(self, path: str | AnyPath):
+        return str(path).startswith("s3://")
+
     def path(self, path: str | AnyPath):
         if not isinstance(path, str):
             return path
-        elif path.startswith("s3://"):
+        elif self.is_s3_path(path):
             return self._s3_client.CloudPath(path)
         else:
             return AnyPath(path)
 
-    def get_arrow_path(self, s3_uri: str):
-        if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
+    def get_arrow_path(self, s3_uri: str | AnyPath):
+        if not self.is_s3_path(s3_uri):
             raise ValueError(
                 f"Invalid URI: '{s3_uri}'. Storage interface strictly requires 's3://' prefix "
                 f"to ensure environment-agnostic path management."
             )
-        raw_path = s3_uri.replace("s3://", "").lstrip("/")
+        raw_path = str(s3_uri).replace("s3://", "").lstrip("/")
         if self.local_s3:
             return os.path.join(self.local_s3_dir, raw_path)
         return raw_path
+
+    def scan_parquet(self, uri: str | AnyPath, **kwargs):
+        if self.is_s3_path(uri):
+            target_path = self.get_arrow_path(uri)
+
+            dataset = ds.dataset(
+                target_path,
+                filesystem=self.s3_fs,
+                format="parquet",
+                partitioning="hive",
+            )
+
+            return pl.scan_pyarrow_dataset(dataset, **kwargs)
+        else:
+            return pl.scan_parquet(uri, **kwargs)
+
+    def read_parquet(self, uri: str | AnyPath):
+        df = self.scan_parquet(uri=uri).collect()
+        return df
+
+    def write_parquet(
+        self,
+        df: pl.DataFrame,
+        uri: str | AnyPath,
+        partition_cols: list[str] | str | None = None,
+        **kwargs,
+    ):
+        if not self.is_s3_path(uri):
+            df.write_parquet(uri, **kwargs)
+            return
+
+        if isinstance(partition_cols, str):
+            partition_cols = [partition_cols]
+
+        target_path = self.get_arrow_path(uri)
+        table = df.to_arrow()
+
+        if partition_cols:
+            ds.write_dataset(
+                table,
+                base_dir=target_path,
+                basename_template="part-{i}.parquet",
+                format="parquet",
+                partitioning=partition_cols,
+                partitioning_flavor="hive",
+                filesystem=self.s3_fs,
+                existing_data_behavior="overwrite_or_ignore",
+                **kwargs,
+            )
+        else:
+            if self.local_s3:
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            pq.write_table(table, target_path, filesystem=self.s3_fs, **kwargs)
