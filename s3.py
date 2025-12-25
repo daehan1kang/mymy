@@ -164,3 +164,21 @@ class Storage:
             if self.local_s3:
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
             pq.write_table(table, target_path, filesystem=self.s3_fs, **kwargs)
+
+    def get_partition_columns(self, s3_uri: str) -> list[str]:
+
+        target_path = self.get_arrow_path(s3_uri)
+        dataset = ds.dataset(
+            target_path, filesystem=self.s3_fs, format="parquet", partitioning="hive"
+        )
+        return dataset.partitioning.schema.names
+
+    def get_partition_values(self, s3_uri: str) -> pl.DataFrame:
+
+        lf = self.scan_parquet(s3_uri)
+        partition_cols = self.get_partition_columns(s3_uri)
+
+        if not partition_cols:
+            return pl.DataFrame()
+
+        return lf.select(partition_cols).unique().collect()
