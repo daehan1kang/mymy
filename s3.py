@@ -1,11 +1,13 @@
 import os
+from pathlib import Path
+from typing import Literal
 
 import boto3
 import polars as pl
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
-from cloudpathlib import AnyPath, S3Client
+from cloudpathlib import AnyPath, CloudPath, S3Client
 from cloudpathlib.local import LocalS3Client
 
 AWS_ACCESS_KEY_ID = "AWS_ACCESS_KEY_ID"
@@ -93,7 +95,7 @@ class Storage:
     def is_s3_path(self, path: str | AnyPath):
         return str(path).startswith("s3://")
 
-    def path(self, path: str | AnyPath):
+    def path(self, path: str | AnyPath)->Path|CloudPath:
         if not isinstance(path, str):
             return path
         elif self.is_s3_path(path):
@@ -136,6 +138,8 @@ class Storage:
         df: pl.DataFrame,
         uri: str | AnyPath,
         partition_cols: list[str] | str | None = None,
+        base_name_template: str = "part-{i}.parquet",
+        existing_data_behavior: Literal["error","overwrite_or_ignore","delete_matching"]="overwrite_or_ignore",
         **kwargs,
     ):
         if not self.is_s3_path(uri):
@@ -152,12 +156,12 @@ class Storage:
             ds.write_dataset(
                 table,
                 base_dir=target_path,
-                basename_template="part-{i}.parquet",
+                basename_template=basename_template,
                 format="parquet",
                 partitioning=partition_cols,
                 partitioning_flavor="hive",
                 filesystem=self.s3_fs,
-                existing_data_behavior="overwrite_or_ignore",
+                existing_data_behavior=existing_data_behavior,
                 **kwargs,
             )
         else:
