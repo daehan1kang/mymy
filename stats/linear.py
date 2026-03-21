@@ -1,11 +1,12 @@
-import os
-import jax
+import cvxpy as cp
 import jax.numpy as jnp
 import lineax as lx
+from cvxpylayers.jax import CvxpyLayer
 from jax import jit
-from jaxtyping import Array, Float, Scalar
+from jaxtyping import Array, ArrayLike, Float, Scalar
 from scipy.stats import chi2
 from scipy.stats import t as t_dist
+
 
 @jit
 def solve_ols_with_lineax(
@@ -68,7 +69,7 @@ def get_ols_statistics(
     # 3. F-statistic (Overall Significance)
     # H0: All non-intercept coefficients are zero
     msm = (tss - rss) / (p - 1)  # Mean Square Model
-    mse = rss / (n - p)          # Mean Square Error
+    mse = rss / (n - p)  # Mean Square Error
     f_stat = msm / mse
 
     # 4. Log-Likelihood
@@ -98,7 +99,7 @@ def get_coefficient_statistics(
 ):
     """
     Computes statistical significance metrics for individual coefficients.
-    
+
     Note: sigma_sq must be the unbiased estimator (RSS / (n-p)).
     """
     n, p = X.shape
@@ -173,14 +174,10 @@ def get_residual_diagnostics(
         "Cond_No": cond_no,
     }
 
-from typing import Any, Dict
 
-def run_regression_analysis(
-    X: Float[Array, "n p"], 
-    y: Float[Array, "n"]
-) -> Dict[str, Any]:
+def run_regression_analysis(X: Float[Array, "n p"], y: Float[Array, "n"]):
     """
-    A comprehensive wrapper that executes the full OLS estimation 
+    A comprehensive wrapper that executes the full OLS estimation
     and returns all diagnostic and inferential statistics.
 
     Args:
@@ -196,38 +193,35 @@ def run_regression_analysis(
     """
     # 1. Parameter Estimation
     beta, sigma_sq = solve_ols_with_lineax(X, y)
-    
+
     # 2. Overall Model Statistics
     model_stats = get_ols_statistics(X, y, beta, sigma_sq)
-    
+
     # 3. Coefficient-level Statistics (Inference)
     coef_stats = get_coefficient_statistics(X, beta, sigma_sq)
-    
+
     # 4. Residual Diagnostics
     diagnostics = get_residual_diagnostics(X, y, beta)
-    
+
     # Consolidate all results into a single dictionary
     results = {
         "beta": beta,
         "sigma_sq": sigma_sq,
         **model_stats,
         **coef_stats,
-        **diagnostics
+        **diagnostics,
     }
-    
+
     return results
+
 
 # Example Usage:
 # results = run_regression_analysis(X_data, y_data)
 # print(f"R-squared: {results['R2']:.4f}")
 # print(f"AIC: {results['AIC']:.2f}")
 
-import cvxpy as cp
-import jax.numpy as jnp
-from cvxpylayers.jax import CvxpyLayer
-from jaxtyping import Array, Float, Scalar
 
-def solve_ols_with_lineax(
+def solve_ols_with_cvxpy0(
     X: Float[Array, "n p"], y: Float[Array, "n"]
 ) -> tuple[Float[Array, "p"], Float[Scalar, ""]]:
     """
@@ -240,15 +234,17 @@ def solve_ols_with_lineax(
     beta_param = cp.Variable(p)
     X_param = cp.Parameter((n, p))
     y_param = cp.Parameter(n)
-    
+
     # OLS Objective: Minimize the sum of squared residuals
     objective = cp.Minimize(cp.sum_squares(X_param @ beta_param - y_param))
     problem = cp.Problem(objective)
-    
+
     # 2. Create the Differentiable Layer
     # This allows the optimization problem to be integrated into JAX's autodiff
-    cvxpy_layer = CvxpyLayer(problem, parameters=[X_param, y_param], variables=[beta_param])
-    
+    cvxpy_layer = CvxpyLayer(
+        problem, parameters=[X_param, y_param], variables=[beta_param]
+    )
+
     # 3. Solve the problem
     # The output of cvxpy_layer is a list of optimal variables
     solution_list = cvxpy_layer(X, y)
@@ -258,5 +254,30 @@ def solve_ols_with_lineax(
     y_hat = X @ beta
     rss = jnp.sum((y - y_hat) ** 2)
     sigma_sq = rss / (n - p)
+
+    return beta, sigma_sq
+
+
+def create_ols_layer(n, p):
+    beta_param = cp.Variable(p)
+    X_param = cp.Parameter((n, p))
+    y_param = cp.Parameter(n)
+
+    objective = cp.Minimize(cp.sum_squares(X_param @ beta_param - y_param))
+    problem = cp.Problem(objective)
+
+    # 레이어 객체를 한 번만 생성합니다.
+    return CvxpyLayer(problem, parameters=[X_param, y_param], variables=[beta_param])
+
+
+def solve_ols_with_cvxpy(X: ArrayLike, y: ArrayLike, cvxpy_layer: CvxpyLayer):
+    # 외부에서 생성된 cvxpy_layer를 호출만 합니다.
+    # solution_list[0]이 beta입니다.
+    beta = cvxpy_layer(X, y)[0]
+
+    # Sigma_sq 계산 (이 부분은 JAX 연산이므로 미분에 문제 없음)
+    y_hat = X @ beta
+    rss = jnp.sum((y - y_hat) ** 2)
+    sigma_sq = rss / (X.shape[0] - X.shape[1])
 
     return beta, sigma_sq
