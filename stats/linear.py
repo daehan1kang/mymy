@@ -1,6 +1,7 @@
 import cvxpy as cp
 import jax.numpy as jnp
 import lineax as lx
+import optimistix as otpx
 from cvxpylayers.jax import CvxpyLayer
 from jax import jit
 from jaxtyping import Array, ArrayLike, Float, Scalar
@@ -281,3 +282,134 @@ def solve_ols_with_cvxpy(X: ArrayLike, y: ArrayLike, cvxpy_layer: CvxpyLayer):
     sigma_sq = rss / (X.shape[0] - X.shape[1])
 
     return beta, sigma_sq
+
+
+def create_regularized_layer(n, p, type="lasso"):
+    beta_param = cp.Variable(p)
+    X_param = cp.Parameter((n, p))
+    y_param = cp.Parameter(n)
+    alpha_param = cp.Parameter(nonneg=True)  # alpha is also a parameter
+
+    rss = cp.sum_squares(X_param @ beta_param - y_param)
+
+    if type == "lasso":
+        # Lasso minimizes: 0.5 * RSS + alpha * ||beta||_1
+        objective = cp.Minimize(0.5 * rss + alpha_param * cp.norm1(beta_param))
+    else:
+        # Ridge minimizes: 0.5 * RSS + 0.5 * alpha * ||beta||_2^2
+        objective = cp.Minimize(
+            0.5 * rss + 0.5 * alpha_param * cp.sum_squares(beta_param)
+        )
+
+    problem = cp.Problem(objective)
+    return CvxpyLayer(
+        problem, parameters=[X_param, y_param, alpha_param], variables=[beta_param]
+    )
+
+
+# Usage within a function
+def solve_regularized_cvxpy(X: ArrayLike, y: ArrayLike, alpha=1.0, reg_type="lasso"):
+    n, p = X.shape
+    layer = create_regularized_layer(n, p, type=reg_type)
+
+    # Solve the optimization problem
+    beta = layer(X, y, jnp.array(alpha))[0]
+
+    # Estimate Sigma^2
+    y_hat = X @ beta
+    rss = jnp.sum((y - y_hat) ** 2)
+    sigma_sq = rss / (n - p)
+
+    return beta, sigma_sq
+
+
+def solve_ridge_lineax(
+    X: Float[Array, "n p"], y: Float[Array, "n"], alpha: float = 1.0
+) -> tuple[Float[Array, "p"], Float[Scalar, ""]]:
+    """
+    Solves Ridge Regression using Lineax via Normal Equations.
+    Ridge minimizes: ||y - Xb||^2 + alpha * ||b||^2
+    """
+    n, p = X.shape
+
+    # Normal Equation for Ridge: (X^T X + alpha * I) beta = X^T y
+    xtx = X.T @ X
+    xty = X.T @ y
+
+    # Add regularization term to the diagonal
+    regularizer = alpha * jnp.eye(p)
+    operator = lx.MatrixLinearOperator(
+        xtx + regularizer, tags=(lx.positive_semidefinite_tag, lx.symmetric_tag)
+    )
+
+    # Solve the linear system
+    solver = lx.Cholesky()
+    solution = lx.linear_solve(operator, xty, solver=solver)
+    beta = solution.value
+
+    # Estimate Sigma^2
+    y_hat = X @ beta
+    rss = jnp.sum((y - y_hat) ** 2)
+    # Note: Using n-p as an approximation for degrees of freedom
+    sigma_sq = rss / (n - p)
+
+    return beta, sigma_sq
+
+
+def solve_ridge_lineax_sklearn_style(X: ArrayLike, y: ArrayLike, alpha=0.5):
+    n, p = X.shape
+    # X는 이미 [1, 1, 1] 컬럼이 추가된 상태라고 가정 (예: 마지막 컬럼이 constant)
+
+    xtx = X.T @ X
+    xty = X.T @ y
+
+    # 규제 행렬 생성
+    reg_matrix = jnp.eye(p) * alpha
+
+    # 핵심: 절편(Intercept) 컬럼에 해당하는 위치의 alpha를 0으로 만듭니다.
+    # 만약 constant 컬럼이 첫 번째라면 [0, 0], 마지막이라면 [p-1, p-1]
+    reg_matrix = reg_matrix.at[0, 0].set(0.0)
+
+    matrix = xtx + reg_matrix
+
+    operator = lx.MatrixLinearOperator(
+        matrix, tags=(lx.positive_semidefinite_tag, lx.symmetric_tag)
+    )
+
+    solution = lx.linear_solve(operator, xty, solver=lx.Cholesky())
+    return solution.value
+
+
+def solve_lasso_simple(
+    X: Float[Array, "n p"], y: Float[Array, "n"], alpha: float = 0.1
+):
+    n, p = X.shape
+
+    # 1. 목적 함수 정의 (MSE + L1 Penalty)
+    def objective_fn(beta, args):
+        X, y, alpha = args
+        residuals = y - X @ beta
+        # JAX는 x=0에서 abs의 서브그레이디언트를 0으로 처리하여 미분합니다.
+        return jnp.sum(residuals**2) + alpha * jnp.sum(jnp.abs(beta))
+
+    # 2. 솔버 설정 (Quasi-Newton 방식인 BFGS 추천)
+    solver = otpx.BFGS(rtol=1e-6, atol=1e-6)
+
+    # 3. 최적화 실행 (y0와 ox.minimise 사용)
+    initial_beta = jnp.zeros(p)
+    sol = otpx.minimise(
+        fn=objective_fn,
+        solver=solver,
+        y0=initial_beta,  # 초기값 인자 이름은 y0
+        args=(X, y, alpha),
+        max_steps=500,
+        throw=False,
+    )
+
+    beta = sol.value
+
+    # 4. 결과 보정 (Sparsity 확보)
+    # 일반 미분 방식은 0 근처로 수렴하므로, 아주 작은 값은 0으로 처리합니다.
+    beta_sparse = jnp.where(jnp.abs(beta) < 1e-5, 0.0, beta)
+
+    return beta_sparse
